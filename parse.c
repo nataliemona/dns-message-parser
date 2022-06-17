@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #define HEADER_BYTES 12
+#define MAX_LABEL_SIZE 63
 
 const char* opcode_names[] = {"QUERY", "IQUERY", "STATUS", NULL, "NOTIFY", "UPDATE"};
 
@@ -23,9 +24,6 @@ const char* rcode_names[] = {
     "NOERROR", "FORMATERROR", "SERVERFAILURE",
     "NAMEERROR", "NOTIMPLEMENTED", "REFUSED",
     "YXDOMAIN", "YXRRSET", "NXRRSET", "NOTAUTH", "NOTZONE"};
-
-// Maybe move to C++ and make this a map?
-const char* rr_types[] = {NULL, "A", "NS", "MD", "MF", "CNAME"};
 
 struct header {
     uint16_t identifier;
@@ -88,21 +86,41 @@ void print_header(struct header* h) {
         htons(h->arcount));
 }
 
-int print_label(unsigned char* label) {
+int print_label_n(unsigned char* msg, off_t offset, int n);
+
+int print_label(unsigned char* msg, off_t offset) {
+    return print_label_n(msg, offset, MAX_LABEL_SIZE);
+}
+
+int print_label_n(unsigned char* msg, off_t offset, int n) {
     int idx = 0;
-    int num = (int)label[0];
+    int num = (int)msg[offset];
+    //printf("\n[%i], n=%i\n", num, n);
 
     while (num != 0) {
-        while (num > 0) {
-            idx += 1;
-            num -= 1;
-            printf("%c", label[idx]);
+        if (num >= 0xc0) {
+            // Extract offset from compression label
+            off_t label_offset = ((msg[offset + idx] & 0x3F) << 8) + msg[offset + idx + 1];
+            int count;
+            print_label(msg, label_offset);
+            //printf("AFTER COMPRESSION LABEL");
+            return idx + 2;
+        } else {
+            while (num > 0) {
+                idx += 1;
+                num -= 1;
+                printf("%c", msg[offset + idx]);
+            }
         }
         idx += 1;
-        num = label[idx];
+        if (idx >= n) {
+            return idx + 1;
+        }
+        num = msg[offset + idx];
+        //printf("\n[%i]\n", num);
         printf(".");
     }
-
+    //printf("\nn_printed = %i, print label returned offset %i\n", *n_printed, idx);
     return idx + 1;
 }
 
@@ -110,7 +128,7 @@ off_t print_question(unsigned char* msg, off_t offset) {
     unsigned char* ptr = msg + offset;
 
     printf(";");
-    int label_len = print_label(ptr);
+    int label_len = print_label(msg, offset);
 
     struct question_footer f;
     memcpy((void*)&f, ptr + label_len, 4);
@@ -127,6 +145,9 @@ off_t print_question(unsigned char* msg, off_t offset) {
         case 1:
             printf("\tA");
             break;
+        case 5:
+            printf("\tCNAME");
+            break;
         case 28:
             printf("\tAAAA");
             break;
@@ -140,26 +161,17 @@ off_t print_question(unsigned char* msg, off_t offset) {
 
 off_t print_answer(unsigned char* msg, off_t offset) {
     unsigned char* ptr = msg + offset;
-
     // // Debug
-    // printf("offset, %lld\n", offset);
+    // printf("OFFSET, %lld\n", offset);
     // for (int i = offset; i < offset + 16; i++) {
     //     printf("%02x ", msg[i]);
     // }
     // printf("\n");
 
-    // Read compressed label
-    if (ptr[0] >= 0xc0) {
-        off_t label_offset = ((ptr[0] & 0x3F) << 8) + ptr[1];
-        print_label(msg + label_offset);
-        ptr += 2;
-    } else {
-        int label_len = print_label(ptr);
-        ptr += label_len;
-    }
+    int n_bytes_read = print_label(msg, offset);
 
     struct answer_data data;
-    memcpy((void*)&data, ptr, sizeof(struct answer_data));
+    memcpy((void*)&data, ptr + n_bytes_read, sizeof(struct answer_data));
 
     unsigned short rr_val = htons(data.type);
     //unsigned short rr_class = htons(data.class);
@@ -171,33 +183,42 @@ off_t print_answer(unsigned char* msg, off_t offset) {
         case 1:
             printf("A\t");
             break;
+        case 5:
+            printf("CNAME\t");
+            break;
         case 28:
             printf("AAAA\t");
             break;
     }
 
-    ptr += sizeof(struct answer_data);
+    n_bytes_read += sizeof(struct answer_data);
     int rd_len;
-    memcpy((void*)&rd_len, ptr, 2);
+    memcpy((void*)&rd_len, ptr + n_bytes_read, 2);
     rd_len = htons(rd_len);
 
-    ptr += 2;
+    n_bytes_read += 2;
+    //printf("\nRD_LEN=%i\n", rd_len);
 
     if (rr_val == 28) {
         char buf[50];
         struct in6_addr addr;
-        memcpy(&addr.s6_addr, ptr, rd_len);
+        memcpy(&addr.s6_addr, ptr + n_bytes_read, rd_len);
         const char* addr_str = inet_ntop(AF_INET6, &addr, buf, 50);
         printf("%s\n", addr_str);
     }
 
     if (rr_val == 1) {
-        for (int i = 0; i < rd_len; i++) {
-            if (i != 0) {
+        for (int i = n_bytes_read; i < n_bytes_read + rd_len; i++) {
+            if (i != n_bytes_read) {
                 printf(".");
             }
-            printf("%i", ptr[i]);
+            printf("%i", *(ptr + i));
         }
+        printf("\n");
+    }
+
+    if (rr_val == 5) {
+        print_label_n(msg, offset + n_bytes_read, rd_len);
         printf("\n");
     }
 
@@ -220,8 +241,11 @@ int main() {
         //const char* input = "9b4c84000001000200000000037777770a636c6f7564666c61726503636f6d0000010001c00c000100010000012c000468107c60c00c000100010000012c000468107b60";
 
         // Test Case 2
-        const char* input = "7ebd84000001000200000000037777770a636c6f7564666c61726503636f6d00001c0001c00c001c00010000012c001026064700000000000000000068107c60c00c001c00010000012c001026064700000000000000000068107b60";
+        //const char* input = "7ebd84000001000200000000037777770a636c6f7564666c61726503636f6d00001c0001c00c001c00010000012c001026064700000000000000000068107c60c00c001c00010000012c001026064700000000000000000068107b60";
 
+        // Test Case 3
+        const char* input = "762081800001000200000000037777770773706f7469667903636f6d0000010001c00c0005000100000102001f12656467652d7765622d73706c69742d67656f096475616c2d67736c62c010c02d000100010000006c000423bae019";
+        
         memcpy(buf, input, strlen(input));
         //printf("input: %s\n", buf);
     } else {
