@@ -22,6 +22,25 @@
 #define ANSWER_FIXED_DATA_LEN 10
 #define MAX_DNS_MSG_LEN 512
 #define MAX_LABEL_SIZE 63
+#define COMPRESSION_LABEL 0xC0
+
+#define IPv4_MAX_LEN 15
+#define IPv6_MAX_LEN 39
+
+// Header Flags
+#define HDR_QR 0x8000
+#define HDR_OPCODE 0x7800
+#define HDR_AA 0x0400
+#define HDR_TC 0x0200
+#define HDR_RD 0x1000
+#define HDR_RA 0x0080
+#define HDR_RCODE 0x000F
+
+// RR Types
+#define A 1
+#define CNAME 5
+#define AAAA 28
+
 
 const char* opcode_names[] = {"QUERY", "IQUERY", "STATUS", NULL, "NOTIFY", "UPDATE"};
 
@@ -62,10 +81,10 @@ int print_label(unsigned char* msg, off_t offset) {
 */
 int print_label_n(unsigned char* msg, off_t offset, int n) {
     int idx = 0;
-    int num = (int)msg[offset];
+    unsigned num = msg[offset];
 
     while (true) {
-        if (num >= 0xc0) {
+        if (num >= COMPRESSION_LABEL) {
             // Extract offset from compression label
             off_t label_offset = ((msg[offset + idx] & 0x3F) << 8) + msg[offset + idx + 1];
             print_label(msg, label_offset);
@@ -98,13 +117,13 @@ int print_label_n(unsigned char* msg, off_t offset, int n) {
 */
 void rr_type(uint16_t type_val, char* buf) {
     switch (type_val) {
-        case 1:
+        case A:
             strcpy(buf, "A");
             break;
-        case 5:
+        case CNAME:
             strcpy(buf, "CNAME");
             break;
-        case 28:
+        case AAAA:
             strcpy(buf, "AAAA");
             break;
         default: {
@@ -140,28 +159,28 @@ void print_header(struct header* h) {
 
     printf(";; ->>HEADER<<- ");
 
-    uint16_t opcode = flags & 0x7800;
+    uint16_t opcode = flags & HDR_OPCODE;
     printf("opcode: %s, ", opcode_names[opcode]);
 
-    uint16_t rcode = flags & 0x000F;
+    uint16_t rcode = flags & HDR_RCODE;
     printf("status: %s, ", rcode_names[rcode]);
 
     printf("id: %u\n", htons(h->identifier));
 
     printf(";; flags:");
-    if (flags & 0x8000) {
+    if (flags & HDR_QR) {
         printf(" qr");
     }
-    if (flags & 0x0400) {
+    if (flags & HDR_AA) {
         printf(" aa");
     }
-    if (flags & 0x0200) {
+    if (flags & HDR_TC) {
         printf(" tc");
     }
-    if (flags & 0x0100) {
+    if (flags & HDR_RD) {
         printf(" rd");
     }
-    if (flags & 0x0080) {
+    if (flags & HDR_RA) {
         printf(" ra");
     }
     printf(
@@ -169,7 +188,8 @@ void print_header(struct header* h) {
         htons(h->qd_count),
         htons(h->an_count),
         htons(h->ns_count),
-        htons(h->ar_count));
+        htons(h->ar_count)
+    );
 }
 
 
@@ -260,30 +280,23 @@ off_t print_answer(unsigned char* msg, off_t offset) {
     // RDLENGTH and RDATA
     int rd_len = htons(data.rd_length);
     switch (rr_type_val) {
-        // A
-        case 1: {
-            for (int i = n_bytes_read; i < n_bytes_read + rd_len; i++) {
-                if (i != n_bytes_read) {
-                    printf(".");
-                }
-                printf("%i", *(ptr + i));
-            }
-            printf("\n");
+        case A: {
+            char buf[IPv4_MAX_LEN + 1];
+            struct in_addr addr;
+            memcpy(&addr.s_addr, ptr + n_bytes_read, rd_len);
+            printf("%s\n", inet_ntop(AF_INET, &addr, buf, IPv4_MAX_LEN + 1));
             break;
         }
-        // AAAA
-        case 5: {
+        case CNAME: {
             print_label_n(msg, offset + n_bytes_read, rd_len);
             printf("\n");
             break;
         }
-        // CNAME
-        case 28: {
-            char buf[50];
+        case AAAA: {
+            char buf[IPv6_MAX_LEN + 1];
             struct in6_addr addr;
             memcpy(&addr.s6_addr, ptr + n_bytes_read, rd_len);
-            const char* addr_str = inet_ntop(AF_INET6, &addr, buf, 50);
-            printf("%s\n", addr_str);
+            printf("%s\n", inet_ntop(AF_INET6, &addr, buf, IPv6_MAX_LEN + 1));
             break;
         }
     }
@@ -331,10 +344,10 @@ int main() {
         //const char* input = "9b4c84000001000200000000037777770a636c6f7564666c61726503636f6d0000010001c00c000100010000012c000468107c60c00c000100010000012c000468107b60";
 
         // Test Case 2
-        //const char* input = "7ebd84000001000200000000037777770a636c6f7564666c61726503636f6d00001c0001c00c001c00010000012c001026064700000000000000000068107c60c00c001c00010000012c001026064700000000000000000068107b60";
+        const char* input = "7ebd84000001000200000000037777770a636c6f7564666c61726503636f6d00001c0001c00c001c00010000012c001026064700000000000000000068107c60c00c001c00010000012c001026064700000000000000000068107b60";
 
         // Test Case 3
-        const char* input = "762081800001000200000000037777770773706f7469667903636f6d0000010001c00c0005000100000102001f12656467652d7765622d73706c69742d67656f096475616c2d67736c62c010c02d000100010000006c000423bae019";
+        //const char* input = "762081800001000200000000037777770773706f7469667903636f6d0000010001c00c0005000100000102001f12656467652d7765622d73706c69742d67656f096475616c2d67736c62c010c02d000100010000006c000423bae019";
         
         memcpy(buf, input, strlen(input));
         //printf("input: %s\n", buf);
