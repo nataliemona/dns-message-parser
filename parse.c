@@ -1,8 +1,10 @@
-// References
-// http://www.tcpipguide.com/free/t_DNSMessageHeaderandQuestionSectionFormat.htm
-// http://www.tcpipguide.com/free/t_DNSNameNotationandMessageCompressionTechnique.htm
-// https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml
-// https://notes.shichao.io/tcpv1/ch11/
+/*  References Used
+    http://www.tcpipguide.com/free/t_DNSMessageHeaderandQuestionSectionFormat.htm
+    http://www.tcpipguide.com/free/t_DNSNameNotationandMessageCompressionTechnique.htm
+    https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml
+    https://notes.shichao.io/tcpv1/ch11/
+    https://www.rfc-editor.org/rfc/rfc1035.txt
+*/
 
 #include <arpa/inet.h>
 #include <assert.h>
@@ -16,6 +18,9 @@
 #include <unistd.h>
 
 #define HEADER_BYTES 12
+#define QUESTION_FIXED_DATA_LEN 4
+#define ANSWER_FIXED_DATA_LEN 10
+#define MAX_DNS_MSG_LEN 512
 #define MAX_LABEL_SIZE 63
 
 const char* opcode_names[] = {"QUERY", "IQUERY", "STATUS", NULL, "NOTIFY", "UPDATE"};
@@ -28,63 +33,23 @@ const char* rcode_names[] = {
 struct header {
     uint16_t identifier;
     uint16_t flags;
-    uint16_t qdcount;
-    uint16_t ancount;
-    uint16_t nscount;
-    uint16_t arcount;
+    uint16_t qd_count;
+    uint16_t an_count;
+    uint16_t ns_count;
+    uint16_t ar_count;
 };
 
-struct question_footer {
-    uint16_t type;
-    uint16_t class;
+struct question_fixed_data {
+    uint16_t type_val;
+    uint16_t class_val;
 };
 
-struct answer_data {
-    uint16_t type;
-    uint16_t class;
+struct answer_fixed_data {
+    uint16_t type_val;
+    uint16_t class_val;
     unsigned ttl;
+    uint16_t rd_length;
 };
-
-void print_header(struct header* h) {
-    uint16_t id = htons(h->identifier);
-    uint16_t flags = htons(h->flags);
-
-    bool qr = flags & 0x8000;
-    uint16_t opcode = flags & 0x7800;
-    bool aa = flags & 0x0400;
-    bool tc = flags & 0x0200;
-    bool rd = flags & 0x0100;
-    bool ra = flags & 0x0080;
-    uint16_t rcode = flags & 0x000F;
-
-    printf(";; ->>HEADER<<- ");
-    printf("opcode: %s, ", opcode_names[opcode]);
-    printf("status: %s, ", rcode_names[rcode]);
-    printf("id: %u\n", id);
-
-    printf(";; flags:");
-    if (qr) {
-        printf(" qr");
-    }
-    if (aa) {
-        printf(" aa");
-    }
-    if (tc) {
-        printf(" tc");
-    }
-    if (rd) {
-        printf(" rd");
-    }
-    if (ra) {
-        printf(" ra");
-    }
-    printf(
-        "; QUERY: %u, ANSWER: %u, AUTHORITY: %u, ADDITIONAL: %u\n",
-        htons(h->qdcount),
-        htons(h->ancount),
-        htons(h->nscount),
-        htons(h->arcount));
-}
 
 int print_label_n(unsigned char* msg, off_t offset, int n);
 
@@ -92,48 +57,148 @@ int print_label(unsigned char* msg, off_t offset) {
     return print_label_n(msg, offset, MAX_LABEL_SIZE);
 }
 
+/*
+    Interpret DNS label format and print label.
+*/
 int print_label_n(unsigned char* msg, off_t offset, int n) {
     int idx = 0;
     int num = (int)msg[offset];
-    //printf("\n[%i], n=%i\n", num, n);
 
-    while (num != 0) {
+    while (true) {
         if (num >= 0xc0) {
             // Extract offset from compression label
             off_t label_offset = ((msg[offset + idx] & 0x3F) << 8) + msg[offset + idx + 1];
-            int count;
             print_label(msg, label_offset);
-            //printf("AFTER COMPRESSION LABEL");
             return idx + 2;
+        } 
+        
+        if (num > 0) {
+            idx += 1;
+            num -= 1;
+            printf("%c", msg[offset + idx]);
+            if (idx >= n) {
+                return idx + 1;
+            }
         } else {
-            while (num > 0) {
-                idx += 1;
-                num -= 1;
-                printf("%c", msg[offset + idx]);
+            idx += 1;
+            if (idx >= n) {
+                return idx + 1;
+            }
+            num = msg[offset + idx];
+            printf(".");
+            if (num == 0) {
+                return idx + 1;
             }
         }
-        idx += 1;
-        if (idx >= n) {
-            return idx + 1;
-        }
-        num = msg[offset + idx];
-        //printf("\n[%i]\n", num);
-        printf(".");
     }
-    //printf("\nn_printed = %i, print label returned offset %i\n", *n_printed, idx);
-    return idx + 1;
 }
 
+/*
+    Convert from Resource Record Type value to name
+*/
+void rr_type(uint16_t type_val, char* buf) {
+    switch (type_val) {
+        case 1:
+            strcpy(buf, "A");
+            break;
+        case 5:
+            strcpy(buf, "CNAME");
+            break;
+        case 28:
+            strcpy(buf, "AAAA");
+            break;
+        default: {
+            fprintf(stderr, "ERROR: Resource Record Type value %i unsupported\n", type_val);
+            exit(1);
+        }
+    }       
+}
+
+
+/*
+    Print DNS Message Header
+
+                                    1  1  1  1  1  1
+      0  1  2  3  4  5  6  7  8  9  0  1  2  3  4  5
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                      ID                       |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |QR|   Opcode  |AA|TC|RD|RA|   Z    |   RCODE   |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                    QDCOUNT                    |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                    ANCOUNT                    |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                    NSCOUNT                    |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                    ARCOUNT                    |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+*/
+void print_header(struct header* h) {
+
+    uint16_t flags = htons(h->flags);
+
+    printf(";; ->>HEADER<<- ");
+
+    uint16_t opcode = flags & 0x7800;
+    printf("opcode: %s, ", opcode_names[opcode]);
+
+    uint16_t rcode = flags & 0x000F;
+    printf("status: %s, ", rcode_names[rcode]);
+
+    printf("id: %u\n", htons(h->identifier));
+
+    printf(";; flags:");
+    if (flags & 0x8000) {
+        printf(" qr");
+    }
+    if (flags & 0x0400) {
+        printf(" aa");
+    }
+    if (flags & 0x0200) {
+        printf(" tc");
+    }
+    if (flags & 0x0100) {
+        printf(" rd");
+    }
+    if (flags & 0x0080) {
+        printf(" ra");
+    }
+    printf(
+        "; QUERY: %u, ANSWER: %u, AUTHORITY: %u, ADDITIONAL: %u\n",
+        htons(h->qd_count),
+        htons(h->an_count),
+        htons(h->ns_count),
+        htons(h->ar_count));
+}
+
+
+/*
+    Print one entry in the DNS message question section starting at
+    offset in the DNS message (msg)
+
+                                    1  1  1  1  1  1
+      0  1  2  3  4  5  6  7  8  9  0  1  2  3  4  5
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                                               |
+    /                     QNAME                     /
+    /                                               /
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                     QTYPE                     |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                     QCLASS                    |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+*/
 off_t print_question(unsigned char* msg, off_t offset) {
     unsigned char* ptr = msg + offset;
 
     printf(";");
     int label_len = print_label(msg, offset);
 
-    struct question_footer f;
-    memcpy((void*)&f, ptr + label_len, 4);
+    struct question_fixed_data rr;
+    memcpy((void*)&rr, ptr + label_len, 4);
 
-    unsigned short query_class = htons(f.class);
+    unsigned short query_class = htons(rr.class_val);
     if (query_class == 1) {
         printf("\t\tIN");
     } else if (query_class == 255) {
@@ -141,94 +206,119 @@ off_t print_question(unsigned char* msg, off_t offset) {
     } else {
         printf("\t\tNO CLASS");
     }
-    switch (htons(f.type)) {
-        case 1:
-            printf("\tA");
-            break;
-        case 5:
-            printf("\tCNAME");
-            break;
-        case 28:
-            printf("\tAAAA");
-            break;
-    }
-    //printf("\t%s", rr_types[htons(f.type)]);
+    char rr_type_name[10];
+    rr_type(htons(rr.type_val), rr_type_name);
+    printf("\t%s\n", rr_type_name);
 
-    printf("\n");
-
-    return offset + label_len + sizeof(struct question_footer);
+    return offset + label_len + QUESTION_FIXED_DATA_LEN;
 }
 
+
+/*
+    Print one entry in the DNS message answer section starting at
+    offset in the DNS message (msg)
+                                    1  1  1  1  1  1
+      0  1  2  3  4  5  6  7  8  9  0  1  2  3  4  5
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                                               |
+    /                                               /
+    /                      NAME                     /
+    |                                               |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                      TYPE                     |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                     CLASS                     |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                      TTL                      |
+    |                                               |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+    |                   RDLENGTH                    |
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--|
+    /                     RDATA                     /
+    /                                               /
+    +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+*/
 off_t print_answer(unsigned char* msg, off_t offset) {
     unsigned char* ptr = msg + offset;
-    // // Debug
-    // printf("OFFSET, %lld\n", offset);
-    // for (int i = offset; i < offset + 16; i++) {
-    //     printf("%02x ", msg[i]);
-    // }
-    // printf("\n");
 
+    // NAME
     int n_bytes_read = print_label(msg, offset);
 
-    struct answer_data data;
-    memcpy((void*)&data, ptr + n_bytes_read, sizeof(struct answer_data));
+    struct answer_fixed_data data;
+    memcpy((void*)&data, ptr + n_bytes_read, sizeof(struct answer_fixed_data));
 
-    unsigned short rr_val = htons(data.type);
+    unsigned short rr_type_val = htons(data.type_val);
     //unsigned short rr_class = htons(data.class);
     int ttl = htonl(data.ttl);
 
-    printf("\t\t%u\t%s\t", ttl, "IN");
+    char rr_type_name[10];
+    rr_type(rr_type_val, rr_type_name);
+    printf("\t\t%u\t%s\t%s\t", ttl, "IN", rr_type_name);
 
-    switch (rr_val) {
-        case 1:
-            printf("A\t");
-            break;
-        case 5:
-            printf("CNAME\t");
-            break;
-        case 28:
-            printf("AAAA\t");
-            break;
-    }
+    n_bytes_read += ANSWER_FIXED_DATA_LEN;
 
-    n_bytes_read += sizeof(struct answer_data);
-    int rd_len;
-    memcpy((void*)&rd_len, ptr + n_bytes_read, 2);
-    rd_len = htons(rd_len);
-
-    n_bytes_read += 2;
-    //printf("\nRD_LEN=%i\n", rd_len);
-
-    if (rr_val == 28) {
-        char buf[50];
-        struct in6_addr addr;
-        memcpy(&addr.s6_addr, ptr + n_bytes_read, rd_len);
-        const char* addr_str = inet_ntop(AF_INET6, &addr, buf, 50);
-        printf("%s\n", addr_str);
-    }
-
-    if (rr_val == 1) {
-        for (int i = n_bytes_read; i < n_bytes_read + rd_len; i++) {
-            if (i != n_bytes_read) {
-                printf(".");
+    // RDLENGTH and RDATA
+    int rd_len = htons(data.rd_length);
+    switch (rr_type_val) {
+        // A
+        case 1: {
+            for (int i = n_bytes_read; i < n_bytes_read + rd_len; i++) {
+                if (i != n_bytes_read) {
+                    printf(".");
+                }
+                printf("%i", *(ptr + i));
             }
-            printf("%i", *(ptr + i));
+            printf("\n");
+            break;
         }
-        printf("\n");
+        // AAAA
+        case 5: {
+            print_label_n(msg, offset + n_bytes_read, rd_len);
+            printf("\n");
+            break;
+        }
+        // CNAME
+        case 28: {
+            char buf[50];
+            struct in6_addr addr;
+            memcpy(&addr.s6_addr, ptr + n_bytes_read, rd_len);
+            const char* addr_str = inet_ntop(AF_INET6, &addr, buf, 50);
+            printf("%s\n", addr_str);
+            break;
+        }
     }
 
-    if (rr_val == 5) {
-        print_label_n(msg, offset + n_bytes_read, rd_len);
-        printf("\n");
+    return offset + 2 + ANSWER_FIXED_DATA_LEN + rd_len;
+}
+
+
+/*
+    Print the DNS Message
+*/
+void print_msg(unsigned char* msg) {
+    struct header h;
+    memcpy((void*)&h, msg, HEADER_BYTES);
+
+    print_header(&h);
+
+    printf("\n;; QUESTION SECTION:\n");
+    int n_questions = htons(h.qd_count);
+    off_t offset = HEADER_BYTES;
+    for (int i = 0; i < n_questions; i++) {
+        offset = print_question(msg, offset);
     }
 
-    return offset + sizeof(struct answer_data) + 2 + rd_len + 2;
+    printf("\n;; ANSWER SECTION:\n");
+    int n_answers = htons(h.an_count);
+    for (int i = 0; i < n_answers; i++) {
+        offset = print_answer(msg, offset);
+    }
 }
 
 int main() {
-    unsigned char buf[400];
-    /* Enter your code here. Read input from STDIN. Print output to STDOUT */
-    memset((void*)buf, 0, 400);
+    int blen = (MAX_DNS_MSG_LEN * 2) + 1;
+    unsigned char buf[blen];
+    memset((void*)buf, 0, blen);
 
     int local = 1;
 
@@ -252,7 +342,7 @@ int main() {
         scanf("%s", buf);
     }
 
-    // Convert input to bytes
+    // Convert input string to bytes
     int msg_len = (strlen((const char*)buf) / 2) + 1;
     unsigned char* msg = (unsigned char*)malloc(msg_len);
     memset((void*)msg, 0, msg_len);
@@ -269,31 +359,8 @@ int main() {
         memcpy((void*)(msg + i), &byte, 1);
     }
 
-    // // Debug
-    // for (int i = 0; i < 68; i++) {
-    //     printf("%02x ", msg[i]);
-    // }
-    // printf("\n");
+    print_msg(msg);
 
-    struct header h;
-    memcpy((void*)&h, msg, HEADER_BYTES);
-
-    print_header(&h);
-    printf("\n");
-    printf(";; QUESTION SECTION:\n");
-    int n_questions = htons(h.qdcount);
-    int n_answers = htons(h.ancount);
-    off_t offset = HEADER_BYTES;
-    for (int i = 0; i < n_questions; i++) {
-        offset = print_question(msg, offset);
-    }
-    printf("\n");
-    //printf("offset=%ld\n", offset);
-    printf(";; ANSWER SECTION:\n");
-    for (int i = 0; i < n_answers; i++) {
-        offset = print_answer(msg, offset);
-    }
-    //printf("offset! %ld\n", offset);
     free(msg);
     return 0;
 }
